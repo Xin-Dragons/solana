@@ -40,6 +40,7 @@ use {
         account_utils::StateMut,
         bpf_loader, bpf_loader_deprecated,
         bpf_loader_upgradeable::{self, UpgradeableLoaderState},
+        compute_budget::ComputeBudgetInstruction,
         feature_set::FeatureSet,
         instruction::{Instruction, InstructionError},
         loader_instruction,
@@ -1545,14 +1546,16 @@ fn close(
     program_pubkey: Option<&Pubkey>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let blockhash = rpc_client.get_latest_blockhash()?;
-
     let mut tx = Transaction::new_unsigned(Message::new(
-        &[bpf_loader_upgradeable::close_any(
-            account_pubkey,
-            recipient_pubkey,
-            Some(&authority_signer.pubkey()),
-            program_pubkey,
-        )],
+        &[
+            ComputeBudgetInstruction::set_compute_unit_price(10_000_000),
+            bpf_loader_upgradeable::close_any(
+                account_pubkey,
+                recipient_pubkey,
+                Some(&authority_signer.pubkey()),
+                program_pubkey,
+            ),
+        ],
         Some(&config.signers[0].pubkey()),
     ));
 
@@ -1796,7 +1799,11 @@ fn do_process_program_write_and_deploy(
     };
     let initial_message = if !initial_instructions.is_empty() {
         Some(Message::new_with_blockhash(
-            &initial_instructions,
+            &[
+                vec![ComputeBudgetInstruction::set_compute_unit_price(50_000_000)],
+                initial_instructions,
+            ]
+            .concat(),
             Some(&config.signers[0].pubkey()),
             &blockhash,
         ))
@@ -1817,7 +1824,14 @@ fn do_process_program_write_and_deploy(
         } else {
             loader_instruction::write(buffer_pubkey, loader_id, offset, bytes)
         };
-        Message::new_with_blockhash(&[instruction], Some(&payer_pubkey), &blockhash)
+        Message::new_with_blockhash(
+            &[
+                ComputeBudgetInstruction::set_compute_unit_price(100_000),
+                instruction,
+            ],
+            Some(&payer_pubkey),
+            &blockhash,
+        )
     };
 
     let mut write_messages = vec![];
@@ -1829,23 +1843,32 @@ fn do_process_program_write_and_deploy(
     // Create and add final message
     let final_message = if let Some(program_signers) = program_signers {
         let message = if loader_id == &bpf_loader_upgradeable::id() {
-            Message::new_with_blockhash(
-                &bpf_loader_upgradeable::deploy_with_max_program_len(
-                    &config.signers[0].pubkey(),
-                    &program_signers[0].pubkey(),
-                    buffer_pubkey,
-                    &program_signers[1].pubkey(),
-                    rpc_client.get_minimum_balance_for_rent_exemption(
-                        UpgradeableLoaderState::size_of_program(),
-                    )?,
-                    programdata_len,
+            let insts = &bpf_loader_upgradeable::deploy_with_max_program_len(
+                &config.signers[0].pubkey(),
+                &program_signers[0].pubkey(),
+                buffer_pubkey,
+                &program_signers[1].pubkey(),
+                rpc_client.get_minimum_balance_for_rent_exemption(
+                    UpgradeableLoaderState::size_of_program(),
                 )?,
+                programdata_len,
+            )?;
+
+            Message::new_with_blockhash(
+                &[
+                    vec![ComputeBudgetInstruction::set_compute_unit_price(10_000_000)],
+                    insts.clone(),
+                ]
+                .concat(),
                 Some(&config.signers[0].pubkey()),
                 &blockhash,
             )
         } else {
             Message::new_with_blockhash(
-                &[loader_instruction::finalize(buffer_pubkey, loader_id)],
+                &[
+                    ComputeBudgetInstruction::set_compute_unit_price(20_000_000),
+                    loader_instruction::finalize(buffer_pubkey, loader_id),
+                ],
                 Some(&config.signers[0].pubkey()),
                 &blockhash,
             )
@@ -2208,23 +2231,44 @@ fn send_deploy_messages(
     if let Some(message) = final_message {
         if let Some(final_signers) = final_signers {
             trace!("Deploying program");
-            let blockhash = rpc_client.get_latest_blockhash()?;
 
-            let mut final_tx = Transaction::new_unsigned(message.clone());
+            let connection_cache = if config.use_quic {
+                ConnectionCache::new_quic("connection_cache_cli_program_quic", 1)
+            } else {
+                ConnectionCache::with_udp("connection_cache_cli_program_udp", 1)
+            };
             let mut signers = final_signers.to_vec();
             signers.push(payer_signer);
-            final_tx.try_sign(&signers, blockhash)?;
-            rpc_client
-                .send_and_confirm_transaction_with_spinner_and_config(
-                    &final_tx,
-                    config.commitment,
-                    RpcSendTransactionConfig {
-                        skip_preflight: true,
-                        preflight_commitment: Some(config.commitment.commitment),
-                        ..RpcSendTransactionConfig::default()
-                    },
-                )
-                .map_err(|e| format!("Deploying program failed: {e}"))?;
+
+            let transaction_errors = match connection_cache {
+                ConnectionCache::Udp(cache) => TpuClient::new_with_connection_cache(
+                    rpc_client.clone(),
+                    &config.websocket_url,
+                    TpuClientConfig::default(),
+                    cache,
+                )?
+                .send_and_confirm_messages_with_spinner(&[message.clone()], &signers),
+                ConnectionCache::Quic(cache) => TpuClient::new_with_connection_cache(
+                    rpc_client.clone(),
+                    &config.websocket_url,
+                    TpuClientConfig::default(),
+                    cache,
+                )?
+                .send_and_confirm_messages_with_spinner(&[message.clone()], &signers),
+            }
+            .map_err(|err| format!("Data writes to account failed: {err}"))?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+
+            if !transaction_errors.is_empty() {
+                for transaction_error in &transaction_errors {
+                    error!("{:?}", transaction_error);
+                }
+                return Err(
+                    format!("{} deploy transaction failed", transaction_errors.len()).into(),
+                );
+            }
         }
     }
 
